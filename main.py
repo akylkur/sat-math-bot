@@ -3,7 +3,14 @@ import json
 from pathlib import Path
 import os
 import random
+import asyncio
 
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -15,12 +22,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 # -------------------------------------
-# LOAD TOKEN
+# LOAD TOKEN (deferred - don't fail at import time)
 # -------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not found in .env")
 
 # -------------------------------------
 # PATHS
@@ -526,6 +531,10 @@ async def fallback_handler(message: Message):
 # MAIN
 # -------------------------------------
 async def main():
+    if not BOT_TOKEN:
+        print("WARNING: BOT_TOKEN not found. Bot will not start.")
+        return
+    
     load_questions()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
@@ -535,5 +544,6 @@ async def main():
     await dp.start_polling(bot)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(main())
