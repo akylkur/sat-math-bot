@@ -20,12 +20,19 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
+import db
 
 # -------------------------------------
 # LOAD TOKEN (deferred - don't fail at import time)
 # -------------------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
+if ADMIN_ID:
+    try:
+        ADMIN_ID = int(ADMIN_ID)
+    except ValueError:
+        ADMIN_ID = None
 
 # -------------------------------------
 # PATHS
@@ -146,6 +153,13 @@ async def send_question_universal(bot, user_id, q, qnum, nav_mode="manual"):
     # First row: answers (A–D), second row: Prev/Next
     kb.adjust(4, 2)
 
+    # Log question_sent event
+    await db.log_event(
+        user_id,
+        "question_sent",
+        {"question_id": q.get("id"), "question_num": qnum, "nav_mode": nav_mode}
+    )
+
     # With image
     image_path = q.get("image")
     if image_path:
@@ -232,7 +246,18 @@ async def send_intro(message: Message):
 # -------------------------------------
 @router.message(CommandStart())
 async def start_handler(message: Message):
-    SEEN_USERS.add(message.from_user.id)
+    user_id = message.from_user.id
+    SEEN_USERS.add(user_id)
+    
+    # Log user_start event
+    await db.ensure_user(
+        user_id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+        last_name=message.from_user.last_name
+    )
+    await db.log_event(user_id, "user_start")
+    
     await send_intro(message)
 
 
@@ -427,6 +452,66 @@ async def topic_handler(message: Message):
 
 
 # -------------------------------------
+# ADMIN COMMANDS
+# -------------------------------------
+@router.message(F.text == "/admin_stats")
+async def admin_stats_handler(message: Message):
+    user_id = message.from_user.id
+    
+    # Check admin access
+    if not ADMIN_ID or user_id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещён.")
+        return
+    
+    try:
+        dau = await db.get_dau_today()
+        attempts_today = await db.get_attempts_today()
+        attempts_total = await db.get_attempts_total()
+        accuracy = await db.get_accuracy()
+        
+        text = (
+            "📊 **Статистика (Admin)**\n\n"
+            f"👥 DAU сегодня: {dau}\n"
+            f"📝 Попытки сегодня: {attempts_today}\n"
+            f"📊 Попытки всего: {attempts_total}\n"
+            f"✅ Accuracy: {accuracy:.1f}%"
+        )
+        await message.answer(text)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения статистики: {e}")
+
+
+@router.message(F.text == "/admin_daily")
+async def admin_daily_handler(message: Message):
+    user_id = message.from_user.id
+    
+    # Check admin access
+    if not ADMIN_ID or user_id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещён.")
+        return
+    
+    try:
+        daily_data = await db.get_attempts_per_day(days=14)
+        
+        if not daily_data:
+            await message.answer("📊 Нет данных за последние 14 дней.")
+            return
+        
+        lines = ["📊 **Попытки по дням (14 дней):**\n"]
+        for date, count in daily_data:
+            lines.append(f"• {date}: {count}")
+        
+        text = "\n".join(lines)
+        # Telegram message limit is 4096 chars
+        if len(text) > 4000:
+            text = text[:4000] + "\n... (обрезано)"
+        
+        await message.answer(text)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения данных: {e}")
+
+
+# -------------------------------------
 # NAVIGATION BUTTONS (Prev/Next)
 # -------------------------------------
 @router.callback_query(F.data.startswith("nav_prev|"))
@@ -476,6 +561,23 @@ async def answer_handler(callback: CallbackQuery, bot: Bot):
     # Update stats
     update_stats(user_id, q, qnum, is_correct)
 
+    # Log attempt and answer_submitted
+    await db.log_attempt(
+        user_id=user_id,
+        question_id=qid,
+        question_num=qnum,
+        user_answer=choice,
+        correct_answer=correct,
+        is_correct=is_correct,
+        difficulty=q.get("difficulty"),
+        topic=q.get("topic")
+    )
+    await db.log_event(
+        user_id,
+        "answer_submitted",
+        {"question_id": qid, "question_num": qnum, "is_correct": is_correct}
+    )
+
     if is_correct:
         result = "✅ Туура!"
     else:
@@ -514,6 +616,14 @@ async def fallback_handler(message: Message):
 
     if user_id not in SEEN_USERS:
         SEEN_USERS.add(user_id)
+        # Log user_start for new users
+        await db.ensure_user(
+            user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name
+        )
+        await db.log_event(user_id, "user_start")
         await send_intro(message)
     else:
         await message.answer(
@@ -535,13 +645,19 @@ async def main():
         print("WARNING: BOT_TOKEN not found. Bot will not start.")
         return
     
+    # Initialize database
+    await db.init_db()
+    
     load_questions()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
 
     print("BOT IS RUNNING...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await db.close_db()
 
 
 @app.on_event("startup")

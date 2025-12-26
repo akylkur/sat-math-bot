@@ -2,3 +2,4 @@ aiogram==3.*
 python-dotenv==1.*
 fastapi
 uvicorn[standard]
+asyncpg
